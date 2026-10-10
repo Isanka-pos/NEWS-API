@@ -1,24 +1,26 @@
 /**
- * Hiru News API  (scrapes https://hirunews.lk)
+ * YouTube Channel Logo API
  * Owner by Isanka Malith
  *
- * Endpoints
- *   GET /                      -> docs
- *   GET /api/news              -> news list  (photo + title + summary + link)
- *        ?category=all|general|international|sports|business|entertainment
- *        &lang=si|en|tm        (default si)
- *        &limit=20             (max 100)
- *        &q=keyword            (search in title/description)
- *        &page=2               (uses news_listing.php, Sinhala only)
- *        &desc=0               (remove full description)
- *        &format=text          (WhatsApp-ready text output)
- *   GET /api/top               -> top story
- *   GET /api/random            -> random news
- *   GET /api/ticker            -> breaking headlines (marquee)
- *   GET /api/tv                -> Hiru TV news bulletins (YouTube links + thumbnails)
- *   GET /api/article?url=...   -> full article details (or ?id=493262)
+ * Input (?url=) can be any of:
+ *   https://www.youtube.com/@handle      https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx
+ *   https://www.youtube.com/c/name       https://www.youtube.com/user/name
+ *   any video / shorts / live link       https://youtu.be/VIDEO_ID
+ *   @handle   or   UCxxxxxxxxxxxxxxxxxxxxxx
  *
- * Optional: set env API_KEY=xxxx  -> clients must send ?apikey=xxxx or x-api-key header
+ * Endpoints
+ *   GET /                         -> docs
+ *   GET /api/ytlogo?url=...       -> JSON: channel info + logo links in many sizes
+ *        &size=512|original       -> also returns that one size as logo.requested
+ *        &redirect=1              -> 302 redirect straight to the image (needs size or default 800)
+ *   GET /api/ytlogo/image?url=... -> returns the image itself (use directly in <img src>)
+ *        &size=512|original
+ *   GET /api/ytlogo/download?url= -> same image, forced download (Content-Disposition: attachment)
+ *
+ * Env (all optional)
+ *   YT_API_KEY  YouTube Data API v3 key -> most reliable (used first, scraping is the fallback)
+ *   API_KEY     protect this API: clients must send ?apikey=... or x-api-key header
+ *   PORT
  */
 
 const express = require('express');
@@ -31,7 +33,15 @@ app.set('trust proxy', 1);
 app.use(cors());
 
 const OWNER = 'Isanka Malith';
-const FOOTER = `\n\n👑 Owner by ${OWNER}`;
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || '';
+const YT_API_KEY = process.env.YT_API_KEY || '';
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour (logos rarely change)
+const RATE_LIMIT = 60; // requests / minute / IP
+
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const SIZES = [48, 64, 88, 100, 120, 176, 240, 300, 400, 512, 800, 900];
 
 // every JSON response gets a "creator" field
 app.use((req, res, next) => {
@@ -41,243 +51,192 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || '';
-const CACHE_TTL = 3 * 60 * 1000; // 3 min
-const RATE_LIMIT = 60; // requests / minute / IP
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
 
-const BASE = 'https://hirunews.lk';
-const LANGS = {
-  si: `${BASE}/`,
-  en: `${BASE}/en`,
-  tm: `${BASE}/tm`
-};
-const CATEGORIES = ['general', 'international', 'sports', 'business', 'entertainment'];
-const CARD_SEL = 'a[class*="card-"]:not(.card-v5)';
+/* ------------------------------ input parsing ------------------------------ */
 
-/* ------------------------------ helpers ------------------------------ */
+const YT_HOST = /^(www\.|m\.|music\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)$/i;
+
+function parseInput(raw) {
+  let s = String(raw || '').trim();
+  if (!s) throw new HttpError(400, 'Provide ?url= (channel link, video link, @handle or channel ID)');
+
+  if (/^UC[\w-]{22}$/.test(s)) return { type: 'id', value: s };
+
+  const looksLikeUrl = /^(https?:\/\/)?(www\.|m\.|music\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)(\/|$)/i.test(s);
+  if (!looksLikeUrl) {
+    if (/^@?[^\s/?#]{2,60}$/.test(s)) return { type: 'handle', value: s.replace(/^@/, '') };
+    throw new HttpError(400, 'Only YouTube links, @handles or channel IDs are supported');
+  }
+
+  if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    throw new HttpError(400, 'Invalid URL');
+  }
+  if (!YT_HOST.test(u.hostname)) throw new HttpError(400, 'Only YouTube links are supported');
+
+  const parts = u.pathname.split('/').filter(Boolean);
+  if (/youtu\.be$/i.test(u.hostname)) {
+    if (parts[0]) return { type: 'video', value: parts[0] };
+    throw new HttpError(400, 'Could not find a video ID in this link');
+  }
+
+  const p0 = parts[0] || '';
+  if (p0.startsWith('@')) return { type: 'handle', value: decodeURIComponent(p0.slice(1)) };
+  if (p0 === 'channel' && parts[1]) return { type: 'id', value: parts[1] };
+  if (p0 === 'c' && parts[1]) return { type: 'custom', value: decodeURIComponent(parts[1]) };
+  if (p0 === 'user' && parts[1]) return { type: 'user', value: decodeURIComponent(parts[1]) };
+  if (['shorts', 'live', 'embed', 'v'].includes(p0) && parts[1]) return { type: 'video', value: parts[1] };
+  if (p0 === 'watch' && u.searchParams.get('v')) return { type: 'video', value: u.searchParams.get('v') };
+
+  throw new HttpError(400, 'Could not detect a YouTube channel or video in this link');
+}
+
+function channelPageUrl(p) {
+  const v = encodeURIComponent(p.value);
+  if (p.type === 'id') return `https://www.youtube.com/channel/${v}`;
+  if (p.type === 'handle') return `https://www.youtube.com/@${v}`;
+  if (p.type === 'custom') return `https://www.youtube.com/c/${v}`;
+  return `https://www.youtube.com/user/${v}`;
+}
+
+// video -> channel (oEmbed is stable and needs no key)
+async function videoToChannel(videoId) {
+  try {
+    const { data } = await axios.get('https://www.youtube.com/oembed', {
+      params: { url: `https://www.youtube.com/watch?v=${videoId}`, format: 'json' },
+      timeout: 15000,
+      headers: { 'User-Agent': UA }
+    });
+    if (!data.author_url) throw new Error('no author_url');
+    return parseInput(data.author_url);
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
+    throw new HttpError(404, 'Video not found (private, deleted or invalid link)');
+  }
+}
+
+/* ------------------------------ logo helpers ------------------------------ */
+
+// "https://yt3.googleusercontent.com/abc=s900-c-k-c0x00ffffff-no-rj"  ->  ".../abc"
+function baseOf(url) {
+  let u = String(url).replace(/\\u0026/g, '&').replace(/^http:/, 'https:');
+  const i = u.lastIndexOf('=');
+  return i > u.lastIndexOf('/') ? u.slice(0, i) : u;
+}
+
+const sizeUrl = (base, size) => (size === 0 ? `${base}=s0` : `${base}=s${size}-c-k-c0x00ffffff-no-rj`);
+
+function parseSize(v, def = null) {
+  if (v === undefined || v === '') return def;
+  if (String(v).toLowerCase() === 'original') return 0;
+  const n = parseInt(v, 10);
+  if (!n || n < 16) throw new HttpError(400, 'size must be a number (16-2048) or "original"');
+  return Math.min(n, 2048);
+}
+
+/* ------------------------------ resolving a channel ------------------------------ */
+
+async function viaDataApi(p) {
+  if (!YT_API_KEY || p.type === 'custom') return null;
+  try {
+    const params = { part: 'snippet', key: YT_API_KEY };
+    if (p.type === 'id') params.id = p.value;
+    else if (p.type === 'handle') params.forHandle = '@' + p.value;
+    else if (p.type === 'user') params.forUsername = p.value;
+    const { data } = await axios.get('https://www.googleapis.com/youtube/v3/channels', { params, timeout: 15000 });
+    const it = data.items && data.items[0];
+    if (!it) return null;
+    const th = it.snippet.thumbnails || {};
+    const best = (th.high || th.medium || th.default || {}).url;
+    if (!best) return null;
+    return {
+      id: it.id,
+      name: it.snippet.title,
+      handle: it.snippet.customUrl || null,
+      base: baseOf(best),
+      source: 'youtube-data-api'
+    };
+  } catch {
+    return null; // fall back to scraping
+  }
+}
+
+async function viaScrape(p) {
+  const url = channelPageUrl(p);
+  let html;
+  try {
+    const res = await axios.get(url, {
+      timeout: 15000,
+      responseType: 'text',
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': UA,
+        'Accept-Language': 'en-US,en;q=0.9',
+        // skips the EU/consent interstitial
+        Cookie: 'CONSENT=YES+cb.20240101-00-p0.en+FX+000; SOCS=CAI'
+      }
+    });
+    html = res.data;
+  } catch (e) {
+    if (e.response && e.response.status === 404) throw new HttpError(404, 'Channel not found');
+    throw new HttpError(502, 'Could not reach YouTube: ' + e.message);
+  }
+
+  const $ = cheerio.load(html);
+  let img = $('meta[property="og:image"]').attr('content');
+  if (!img || !/googleusercontent|ggpht/.test(img)) {
+    const m = html.match(/"avatar":\{"thumbnails":\[\{"url":"([^"]+)"/);
+    img = m ? m[1] : null;
+  }
+  if (!img) {
+    throw new HttpError(
+      404,
+      'Channel logo not found (wrong link, or YouTube blocked this server). Set YT_API_KEY for guaranteed results.'
+    );
+  }
+
+  const canonical = $('link[rel="canonical"]').attr('href') || '';
+  const handleMatch = canonical.match(/youtube\.com\/@([^/?#]+)/);
+  const id =
+    $('meta[itemprop="identifier"]').attr('content') ||
+    (html.match(/"channelId":"(UC[\w-]{22})"/) || [])[1] ||
+    (html.match(/"externalId":"(UC[\w-]{22})"/) || [])[1] ||
+    (p.type === 'id' ? p.value : null);
+
+  return {
+    id,
+    name: $('meta[property="og:title"]').attr('content') || null,
+    handle: handleMatch ? '@' + decodeURIComponent(handleMatch[1]) : p.type === 'handle' ? '@' + p.value : null,
+    base: baseOf(img),
+    source: 'youtube-page'
+  };
+}
 
 const cache = new Map();
 
-async function getHtml(url) {
-  const hit = cache.get(url);
-  if (hit && Date.now() - hit.t < CACHE_TTL) return hit.html;
-  try {
-    const { data } = await axios.get(url, {
-      timeout: 15000,
-      responseType: 'text',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-        'Accept-Language': 'si,en;q=0.8'
-      }
-    });
-    if (cache.size > 60) cache.delete(cache.keys().next().value);
-    cache.set(url, { t: Date.now(), html: data });
-    return data;
-  } catch (e) {
-    if (hit) return hit.html; // site down -> serve stale
-    throw e;
-  }
-}
+async function resolveChannel(raw) {
+  let p = parseInput(raw);
+  if (p.type === 'video') p = await videoToChannel(p.value);
 
-const txt = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const key = `${p.type}:${p.value.toLowerCase()}`;
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.t < CACHE_TTL) return hit.data;
 
-const abs = (u) => {
-  try {
-    return u ? new URL(u, BASE).href : null;
-  } catch {
-    return null;
-  }
-};
+  const info = (await viaDataApi(p)) || (await viaScrape(p));
+  info.url = info.id ? `https://www.youtube.com/channel/${info.id}` : channelPageUrl(p);
 
-const getId = (link) => {
-  const m = (link || '').match(/\/(\d{4,})(?:\/|$)/);
-  return m ? parseInt(m[1], 10) : null;
-};
-
-const MONTHS = {
-  january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
-  july: 7, august: 8, september: 9, october: 10, november: 11, december: 12
-};
-
-// "09 October 2026 2:10 PM" -> "2026-10-09T14:10:00+05:30"
-function parseDate(t) {
-  const m = (t || '').match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})(?:\s+(\d{1,2}):(\d{2})\s*(AM|PM))?/i);
-  if (!m) return null;
-  const mon = MONTHS[m[2].toLowerCase()];
-  if (!mon) return null;
-  let h = m[4] ? parseInt(m[4], 10) : 0;
-  const ap = (m[6] || '').toUpperCase();
-  if (ap === 'PM' && h < 12) h += 12;
-  if (ap === 'AM' && h === 12) h = 0;
-  const p = (n) => String(n).padStart(2, '0');
-  return `${m[3]}-${p(mon)}-${p(m[1])}T${p(h)}:${p(m[5] || 0)}:00+05:30`;
-}
-
-function categoryFromLink(link) {
-  if (/\/sports\//.test(link)) return 'Sports';
-  if (/\/business\//.test(link)) return 'Business';
-  if (/\/entertainment\//.test(link)) return 'Entertainment';
-  return null;
-}
-
-/* ------------------------------ scraping ------------------------------ */
-
-function parseCard($, el) {
-  const $el = $(el);
-  const link = abs($el.attr('href'));
-  const title = txt($el.find('[class*="card-title"]').first().text() || $el.find('.title').first().text());
-  if (!link || !title) return null;
-
-  const description = txt($el.find('.description').first().text());
-  const image = abs($el.find('img').first().attr('src'));
-  const dateText = txt($el.find('.update-wrp-lg span').not('.update-category').first().text());
-
-  let section = '';
-  if ($el.hasClass('card-featured')) {
-    section = 'Top Story';
-  } else {
-    const box = $el.closest(
-      '.slider-section, .featured-cards, .home-most-top-news, .home-international-trad-news, .home-more-news'
-    );
-    section = txt(box.find('.heading-wrp h5').first().text());
-  }
-
-  let category = txt($el.find('.update-category').first().text()) || categoryFromLink(link);
-  if (!category && /sports/i.test(section)) category = 'Sports';
-  if (!category && /business/i.test(section)) category = 'Business';
-  if (!category && /entertainment/i.test(section)) category = 'Entertainment';
-
-  return {
-    id: getId(link),
-    title,
-    summary: description.length > 220 ? description.slice(0, 217).trim() + '...' : description,
-    description,
-    image,
-    link,
-    category: category || 'General',
-    section,
-    date: dateText || null,
-    published: parseDate(dateText)
-  };
-}
-
-function parseCards(html) {
-  const $ = cheerio.load(html);
-  const map = new Map();
-  $(CARD_SEL).each((_, el) => {
-    const item = parseCard($, el);
-    if (!item) return;
-    const key = item.id || item.link;
-    const old = map.get(key);
-    if (!old) map.set(key, item);
-    else {
-      // merge: keep the richer data
-      if (item.description.length > old.description.length) {
-        old.description = item.description;
-        old.summary = item.summary;
-      }
-      if (!old.image && item.image) old.image = item.image;
-      if (!old.date && item.date) {
-        old.date = item.date;
-        old.published = item.published;
-      }
-      if (old.category === 'General' && item.category !== 'General') old.category = item.category;
-    }
-  });
-  // newest first (ids grow with time)
-  return [...map.values()].sort((a, b) => (b.id || 0) - (a.id || 0));
-}
-
-async function getNews({ lang = 'si', category = 'all', page = 1 }) {
-  const useListing = page > 1 && lang === 'si' && category !== 'all';
-  if (useListing) {
-    const c = category.charAt(0).toUpperCase() + category.slice(1);
-    const url = `${BASE}/news_listing.php?category=${c}&page=${page}`;
-    const items = parseCards(await getHtml(url));
-    if (items.length) return items;
-  }
-  const items = parseCards(await getHtml(LANGS[lang] || LANGS.si));
-  if (category === 'all') return items;
-  return items.filter((i) => i.category.toLowerCase() === category);
-}
-
-async function getTicker(lang = 'si') {
-  const $ = cheerio.load(await getHtml(LANGS[lang] || LANGS.si));
-  const out = [];
-  $('.hnticker_marquee .news-heading a').each((_, el) => {
-    const link = abs($(el).attr('href'));
-    const title = txt($(el).text());
-    if (title && link) out.push({ id: getId(link), title, link });
-  });
-  return out;
-}
-
-async function getTv() {
-  const $ = cheerio.load(await getHtml(LANGS.si));
-  const out = [];
-  $('.tv-news-section .col-lg-4').each((_, col) => {
-    const bulletin = txt($(col).find('.intro-content h5').first().text());
-    $(col)
-      .find('a.card-v5')
-      .each((__, a) => {
-        const $a = $(a);
-        const thumb = $a.find('img').first().attr('src') || '';
-        const yt = thumb.match(/vi\/([\w-]{6,})\//);
-        out.push({
-          bulletin,
-          title: txt($a.find('[class*="card-title"]').first().text()),
-          date: txt($a.find('.update-wrp-lg span').first().text()),
-          link: abs($a.attr('href')),
-          thumbnail: thumb || null,
-          youtube: yt ? `https://www.youtube.com/watch?v=${yt[1]}` : null
-        });
-      });
-  });
-  return out;
-}
-
-async function getArticle(url) {
-  const html = await getHtml(url);
-  const $ = cheerio.load(html);
-  const og = (p) => $(`meta[property="og:${p}"]`).attr('content') || null;
-
-  // JSON-LD NewsArticle (if the page has one)
-  let ld = null;
-  $('script[type="application/ld+json"]').each((_, s) => {
-    if (ld) return;
-    try {
-      const j = JSON.parse($(s).contents().text());
-      const find = (o) => {
-        if (!o || typeof o !== 'object') return null;
-        if (o['@type'] === 'NewsArticle') return o;
-        for (const v of Object.values(o)) {
-          const r = find(v);
-          if (r) return r;
-        }
-        return null;
-      };
-      ld = find(j);
-    } catch {}
-  });
-
-  $('header, footer, nav, script, style, .mobile-menu').remove();
-  const paras = [];
-  $('p').each((_, p) => {
-    const t = txt($(p).text());
-    if (t.length > 30) paras.push(t);
-  });
-
-  return {
-    id: getId(url),
-    title: og('title') || (ld && ld.headline) || txt($('title').text()),
-    image: og('image') || (ld && ld.image) || null,
-    link: url,
-    published: (ld && ld.datePublished) || null,
-    description: og('description') || (ld && ld.description) || null,
-    content: paras.join('\n\n') || (ld && ld.description) || null
-  };
+  if (cache.size > 500) cache.delete(cache.keys().next().value);
+  cache.set(key, { t: Date.now(), data: info });
+  return info;
 }
 
 /* ------------------------------ middleware ------------------------------ */
@@ -307,132 +266,77 @@ const wrap = (fn) => async (req, res) => {
   try {
     await fn(req, res);
   } catch (e) {
-    res.status(502).json({ status: false, error: 'Failed to fetch from hirunews.lk', detail: e.message });
+    res.status(e.status || 500).json({ status: false, error: e.message });
   }
 };
-
-const toText = (item) =>
-  `📰 *${item.title}*\n\n${item.summary || ''}\n\n🗞️ ${item.category}${item.date ? ' | 🕒 ' + item.date : ''}\n🔗 ${item.link}`;
 
 /* ------------------------------ routes ------------------------------ */
 
 app.get('/', (req, res) => {
   res.json({
     status: true,
-    name: 'Hiru News API',
+    name: 'YouTube Channel Logo API',
     endpoints: {
-      news: '/api/news?category=all&lang=si&limit=10&q=&page=1&format=json|text&desc=0',
-      top: '/api/top',
-      random: '/api/random',
-      ticker: '/api/ticker',
-      tv: '/api/tv',
-      article: '/api/article?id=493262  or  /api/article?url=https://hirunews.lk/...'
+      json: '/api/ytlogo?url=https://www.youtube.com/@MrBeast&size=512',
+      image: '/api/ytlogo/image?url=@MrBeast&size=512   (use inside <img src>)',
+      download: '/api/ytlogo/download?url=@MrBeast&size=original'
     },
-    categories: ['all', ...CATEGORIES],
-    languages: Object.keys(LANGS)
+    accepts: ['channel link', '@handle', 'channel ID (UC...)', 'any video / shorts / youtu.be link'],
+    sizes: SIZES
   });
 });
 
 app.get(
-  '/api/news',
+  '/api/ytlogo',
   wrap(async (req, res) => {
-    const lang = LANGS[req.query.lang] ? req.query.lang : 'si';
-    const category = String(req.query.category || 'all').toLowerCase();
-    if (category !== 'all' && !CATEGORIES.includes(category)) {
-      return res.status(400).json({ status: false, error: 'Invalid category', available: ['all', ...CATEGORIES] });
-    }
-    const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
-    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const info = await resolveChannel(req.query.url);
+    const size = parseSize(req.query.size);
 
-    let items = await getNews({ lang, category, page });
+    if (req.query.redirect === '1') return res.redirect(302, sizeUrl(info.base, size === null ? 800 : size));
 
-    const q = String(req.query.q || '').trim().toLowerCase();
-    if (q) items = items.filter((i) => (i.title + ' ' + i.description).toLowerCase().includes(q));
+    const sizes = {};
+    SIZES.forEach((s) => (sizes[s] = sizeUrl(info.base, s)));
 
-    items = items.slice(0, limit);
+    const logo = { original: sizeUrl(info.base, 0), sizes };
+    if (size !== null) logo.requested = { size: size === 0 ? 'original' : size, url: sizeUrl(info.base, size) };
 
-    if (req.query.format === 'text') {
-      res.type('text/plain; charset=utf-8');
-      return res.send(items.map(toText).join('\n\n━━━━━━━━━━\n\n') + FOOTER);
-    }
-
-    if (req.query.desc === '0') items = items.map(({ description, ...rest }) => rest);
-
-    res.json({ status: true, source: 'Hiru News', lang, category, page, count: items.length, news: items });
+    res.json({
+      status: true,
+      channel: { id: info.id, name: info.name, handle: info.handle, url: info.url },
+      logo,
+      source: info.source
+    });
   })
 );
 
-app.get(
-  '/api/top',
-  wrap(async (req, res) => {
-    const lang = LANGS[req.query.lang] ? req.query.lang : 'si';
-    const html = await getHtml(LANGS[lang]);
-    const $ = cheerio.load(html);
-    const el = $('a.card-featured').first();
-    const item = el.length ? parseCard($, el) : (await getNews({ lang }))[0];
-    if (!item) return res.status(404).json({ status: false, error: 'Top story not found' });
-    if (req.query.format === 'text') return res.type('text/plain; charset=utf-8').send(toText(item) + FOOTER);
-    res.json({ status: true, news: item });
-  })
-);
+async function sendImage(req, res, disposition) {
+  const info = await resolveChannel(req.query.url);
+  const size = parseSize(req.query.size, 800);
+  let r;
+  try {
+    r = await axios.get(sizeUrl(info.base, size), {
+      responseType: 'arraybuffer',
+      timeout: 20000,
+      headers: { 'User-Agent': UA, Accept: 'image/png,image/jpeg,image/*;q=0.8' }
+    });
+  } catch (e) {
+    throw new HttpError(502, 'Could not download the image: ' + e.message);
+  }
+  const type = r.headers['content-type'] || 'image/jpeg';
+  const ext = type.includes('png') ? 'png' : type.includes('webp') ? 'webp' : 'jpg';
+  const who = (info.handle || info.id || 'channel').replace(/[^\w.@-]/g, '');
+  res.set({
+    'Content-Type': type,
+    'Content-Disposition': `${disposition}; filename="${who}-logo-${size === 0 ? 'original' : size}.${ext}"`,
+    'Cache-Control': 'public, max-age=86400',
+    'X-Owner': OWNER
+  });
+  res.send(Buffer.from(r.data));
+}
 
-app.get(
-  '/api/random',
-  wrap(async (req, res) => {
-    const lang = LANGS[req.query.lang] ? req.query.lang : 'si';
-    const items = await getNews({ lang });
-    const item = items[Math.floor(Math.random() * items.length)];
-    if (!item) return res.status(404).json({ status: false, error: 'No news found' });
-    if (req.query.format === 'text') return res.type('text/plain; charset=utf-8').send(toText(item) + FOOTER);
-    res.json({ status: true, news: item });
-  })
-);
-
-app.get(
-  '/api/ticker',
-  wrap(async (req, res) => {
-    const lang = LANGS[req.query.lang] ? req.query.lang : 'si';
-    const headlines = await getTicker(lang);
-    res.json({ status: true, count: headlines.length, headlines });
-  })
-);
-
-app.get(
-  '/api/tv',
-  wrap(async (req, res) => {
-    const bulletins = await getTv();
-    res.json({ status: true, count: bulletins.length, bulletins });
-  })
-);
-
-app.get(
-  '/api/article',
-  wrap(async (req, res) => {
-    let url = req.query.url;
-    if (!url && req.query.id) {
-      const id = parseInt(req.query.id, 10);
-      for (const lang of Object.keys(LANGS)) {
-        const found = (await getNews({ lang })).find((i) => i.id === id);
-        if (found) {
-          url = found.link;
-          break;
-        }
-      }
-      if (!url) return res.status(404).json({ status: false, error: 'ID not found on the front pages, use ?url= instead' });
-    }
-    if (!url) return res.status(400).json({ status: false, error: 'Provide ?url= or ?id=' });
-    if (!/^https?:\/\/(www\.)?hirunews\.lk\//i.test(url)) {
-      return res.status(400).json({ status: false, error: 'Only hirunews.lk links are allowed' });
-    }
-    const article = await getArticle(url);
-    if (req.query.format === 'text') {
-      res.type('text/plain; charset=utf-8');
-      return res.send(`📰 *${article.title}*\n\n${article.content || article.description || ''}\n\n🔗 ${article.link}` + FOOTER);
-    }
-    res.json({ status: true, article });
-  })
-);
+app.get('/api/ytlogo/image', wrap((req, res) => sendImage(req, res, 'inline')));
+app.get('/api/ytlogo/download', wrap((req, res) => sendImage(req, res, 'attachment')));
 
 app.use((req, res) => res.status(404).json({ status: false, error: 'Not found' }));
 
-app.listen(PORT, () => console.log(`Hiru News API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`YouTube Logo API running on port ${PORT}`));
